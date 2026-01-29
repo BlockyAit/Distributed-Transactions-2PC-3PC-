@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
 """
-Lab 4 Coordinator (2PC/3PC) with WAL persistence and retries
+Lab 4 Participant (2PC/3PC) with WAL persistence and replay
+===================================================================
+
+2PC endpoints:
+- POST /prepare   {"txid":"TX1","op":{...}} -> {"vote":"YES"/"NO"}
+- POST /commit    {"txid":"TX1"}
+- POST /abort     {"txid":"TX1"}
+
+3PC endpoints (bonus):
+- POST /can_commit {"txid":"TX1","op":{...}} -> {"vote":"YES"/"NO"}
+- POST /precommit  {"txid":"TX1"}
+
+GET:
+- /status
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib import request
 import argparse
 import json
 import threading
 import time
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Optional
 
 lock = threading.Lock()
 
 NODE_ID: str = ""
-PORT: int = 8000
-PARTICIPANTS: List[str] = []
-TIMEOUT_S: float = 2.0
-WAL_PATH: str = "/tmp/coordinator.wal"
+PORT: int = 8001
 
+kv: Dict[str, str] = {}
 TX: Dict[str, Dict[str, Any]] = {}
+
+WAL_PATH: Optional[str] = None
 
 # ---------------------------
 # JSON helpers
@@ -31,185 +43,65 @@ def jload(b: bytes) -> Any:
     return json.loads(b.decode("utf-8"))
 
 # ---------------------------
-# HTTP helper
-# ---------------------------
-def post_json(url: str, payload: dict, timeout: float = TIMEOUT_S) -> Tuple[int, dict]:
-    data = jdump(payload)
-    req = request.Request(url, data=data, headers={"Content-Type":"application/json"}, method="POST")
-    with request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, jload(resp.read())
-
-# ---------------------------
 # WAL helpers
 # ---------------------------
 def wal_append(line: str) -> None:
-    """Append a line to coordinator WAL."""
+    if not WAL_PATH:
+        return
     with open(WAL_PATH, "a", encoding="utf-8") as f:
         f.write(line.rstrip("\n") + "\n")
+        f.flush()
+        try:
+            import os
+            os.fsync(f.fileno())
+        except Exception:
+            pass  # fallback if fsync fails
 
 def replay_wal() -> None:
-    """Replay WAL on startup to restore TX states."""
+    """Replay WAL to restore participant TX states after crash."""
+    if not WAL_PATH:
+        return
     try:
         with open(WAL_PATH, "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split(" ", 2)
-                if len(parts) < 2:
+                if not parts:
                     continue
                 txid, state = parts[0], parts[1]
+                op = None
+                if len(parts) == 3:
+                    try:
+                        op = json.loads(parts[2])
+                    except Exception:
+                        op = None
                 with lock:
-                    TX.setdefault(txid, {
-                        "txid": txid,
-                        "state": state,
-                        "votes": {},
-                        "decision": None,
-                        "participants": list(PARTICIPANTS)
-                    })
+                    TX.setdefault(txid, {"state": state, "op": op, "ts": time.time()})
+                    # Recover committed ops
+                    if state == "COMMIT" and op:
+                        kv[str(op["key"])] = str(op.get("value", ""))
     except FileNotFoundError:
         pass
 
 # ---------------------------
-# Two-Phase Commit (2PC)
+# KV helpers
 # ---------------------------
-def two_pc(txid: str, op: dict) -> dict:
-    with lock:
-        TX[txid] = {
-            "txid": txid, "protocol": "2PC", "state": "PREPARE_SENT",
-            "op": op, "votes": {}, "decision": None,
-            "participants": list(PARTICIPANTS), "ts": time.time()
-        }
+def validate_op(op: dict) -> bool:
+    t = str(op.get("type", "")).upper()
+    if t != "SET":
+        return False
+    if not str(op.get("key", "")).strip():
+        return False
+    return True
 
-    wal_append(f"{txid} PREPARE_SENT {op}")
-
-    votes = {}
-    all_yes = True
-    for p in PARTICIPANTS:
-        try:
-            _, resp = post_json(p.rstrip("/") + "/prepare", {"txid": txid, "op": op})
-            vote = str(resp.get("vote", "NO")).upper()
-            votes[p] = vote
-            if vote != "YES":
-                all_yes = False
-        except Exception:
-            votes[p] = "NO_TIMEOUT"
-            all_yes = False
-
-    decision = "COMMIT" if all_yes else "ABORT"
-    with lock:
-        TX[txid]["votes"] = votes
-        TX[txid]["decision"] = decision
-        TX[txid]["state"] = f"{decision}_SENT"
-
-    wal_append(f"{txid} {decision}_SENT {votes}")
-
-    endpoint = "/commit" if decision == "COMMIT" else "/abort"
-    for p in PARTICIPANTS:
-        retries = 3
-        for i in range(retries):
-            try:
-                post_json(p.rstrip("/") + endpoint, {"txid": txid})
-                break
-            except Exception:
-                time.sleep(0.5)
-                if i == retries - 1:
-                    print(f"[{NODE_ID}] Failed to send {endpoint} to {p} after {retries} retries")
-
-    with lock:
-        TX[txid]["state"] = "DONE"
-    wal_append(f"{txid} DONE")
-
-    return {"ok": True, "txid": txid, "protocol": "2PC", "decision": decision, "votes": votes}
+def apply_op(op: dict) -> None:
+    t = str(op.get("type", "")).upper()
+    if t == "SET":
+        k = str(op["key"])
+        v = str(op.get("value", ""))
+        kv[k] = v
 
 # ---------------------------
-# Three-Phase Commit (3PC)
-# ---------------------------
-def three_pc(txid: str, op: dict) -> dict:
-    with lock:
-        TX[txid] = {
-            "txid": txid, "protocol": "3PC", "state": "CAN_COMMIT_SENT",
-            "op": op, "votes": {}, "decision": None,
-            "participants": list(PARTICIPANTS), "ts": time.time()
-        }
-
-    wal_append(f"{txid} CAN_COMMIT_SENT {op}")
-
-    votes = {}
-    all_yes = True
-    for p in PARTICIPANTS:
-        try:
-            _, resp = post_json(p.rstrip("/") + "/can_commit", {"txid": txid, "op": op})
-            vote = str(resp.get("vote", "NO")).upper()
-            votes[p] = vote
-            if vote != "YES":
-                all_yes = False
-        except Exception:
-            votes[p] = "NO_TIMEOUT"
-            all_yes = False
-
-    with lock:
-        TX[txid]["votes"] = votes
-
-    if not all_yes:
-        with lock:
-            TX[txid]["decision"] = "ABORT"
-            TX[txid]["state"] = "ABORT_SENT"
-        wal_append(f"{txid} ABORT_SENT {votes}")
-        for p in PARTICIPANTS:
-            retries = 3
-            for i in range(retries):
-                try:
-                    post_json(p.rstrip("/") + "/abort", {"txid": txid})
-                    break
-                except Exception:
-                    time.sleep(0.5)
-                    if i == retries - 1:
-                        print(f"[{NODE_ID}] Failed to send /abort to {p} after {retries} retries")
-        with lock:
-            TX[txid]["state"] = "DONE"
-        wal_append(f"{txid} DONE")
-        return {"ok": True, "txid": txid, "protocol": "3PC", "decision": "ABORT", "votes": votes}
-
-    with lock:
-        TX[txid]["decision"] = "PRECOMMIT"
-        TX[txid]["state"] = "PRECOMMIT_SENT"
-    wal_append(f"{txid} PRECOMMIT_SENT")
-
-    for p in PARTICIPANTS:
-        retries = 3
-        for i in range(retries):
-            try:
-                post_json(p.rstrip("/") + "/precommit", {"txid": txid})
-                break
-            except Exception:
-                time.sleep(0.5)
-                if i == retries - 1:
-                    print(f"[{NODE_ID}] Failed to send /precommit to {p} after {retries} retries")
-
-    time.sleep(2)  # make PRECOMMIT observable
-
-    with lock:
-        TX[txid]["decision"] = "COMMIT"
-        TX[txid]["state"] = "DOCOMMIT_SENT"
-    wal_append(f"{txid} DOCOMMIT_SENT")
-
-    for p in PARTICIPANTS:
-        retries = 3
-        for i in range(retries):
-            try:
-                post_json(p.rstrip("/") + "/commit", {"txid": txid})
-                break
-            except Exception:
-                time.sleep(0.5)
-                if i == retries - 1:
-                    print(f"[{NODE_ID}] Failed to send /commit to {p} after {retries} retries")
-
-    with lock:
-        TX[txid]["state"] = "DONE"
-    wal_append(f"{txid} DONE")
-
-    return {"ok": True, "txid": txid, "protocol": "3PC", "decision": "COMMIT", "votes": votes}
-
-# ---------------------------
-# HTTP Handler
+# HTTP handler
 # ---------------------------
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict):
@@ -223,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/status"):
             with lock:
-                self._send(200, {"ok": True, "node": NODE_ID, "port": PORT, "participants": PARTICIPANTS, "tx": TX})
+                self._send(200, {"ok": True, "node": NODE_ID, "port": PORT, "kv": kv, "tx": TX, "wal": WAL_PATH})
             return
         self._send(404, {"ok": False, "error": "not found"})
 
@@ -236,24 +128,99 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": "invalid json"})
             return
 
-        if self.path == "/tx/start":
+        # ---------------------------
+        # 2PC /prepare
+        # ---------------------------
+        if self.path == "/prepare":
             txid = str(body.get("txid", "")).strip()
             op = body.get("op", None)
-            protocol = str(body.get("protocol", "2PC")).upper()
-
             if not txid or not isinstance(op, dict):
                 self._send(400, {"ok": False, "error": "txid and op required"})
                 return
-            if protocol not in ("2PC", "3PC"):
-                self._send(400, {"ok": False, "error": "protocol must be 2PC or 3PC"})
+
+            vote = "YES" if validate_op(op) else "NO"
+            with lock:
+                TX[txid] = {"state": "READY" if vote == "YES" else "ABORTED", "op": op, "ts": time.time()}
+            wal_append(f"{txid} PREPARE {vote} {json.dumps(op)}")
+
+            self._send(200, {"ok": True, "vote": vote, "state": TX[txid]["state"]})
+            return
+
+        # ---------------------------
+        # /commit
+        # ---------------------------
+        if self.path == "/commit":
+            txid = str(body.get("txid", "")).strip()
+            if not txid:
+                self._send(400, {"ok": False, "error": "txid required"})
                 return
 
-            if protocol == "2PC":
-                result = two_pc(txid, op)
-            else:
-                result = three_pc(txid, op)
+            with lock:
+                rec = TX.get(txid)
+                if not rec:
+                    self._send(409, {"ok": False, "error": "unknown txid"})
+                    return
+                if rec["state"] not in ("READY", "PRECOMMIT"):
+                    self._send(409, {"ok": False, "error": f"cannot commit from state={rec['state']}"} )
+                    return
+                apply_op(rec["op"])
+                rec["state"] = "COMMITTED"
+            wal_append(f"{txid} COMMIT")
 
-            self._send(200, result)
+            self._send(200, {"ok": True, "txid": txid, "state": "COMMITTED"})
+            return
+
+        # ---------------------------
+        # /abort
+        # ---------------------------
+        if self.path == "/abort":
+            txid = str(body.get("txid", "")).strip()
+            if not txid:
+                self._send(400, {"ok": False, "error": "txid required"})
+                return
+            with lock:
+                rec = TX.get(txid)
+                if rec:
+                    rec["state"] = "ABORTED"
+                else:
+                    TX[txid] = {"state": "ABORTED", "op": None, "ts": time.time()}
+            wal_append(f"{txid} ABORT")
+
+            self._send(200, {"ok": True, "txid": txid, "state": "ABORTED"})
+            return
+
+        # ---------------------------
+        # 3PC /can_commit
+        # ---------------------------
+        if self.path == "/can_commit":
+            txid = str(body.get("txid", "")).strip()
+            op = body.get("op", None)
+            if not txid or not isinstance(op, dict):
+                self._send(400, {"ok": False, "error": "txid and op required"})
+                return
+            vote = "YES" if validate_op(op) else "NO"
+            with lock:
+                TX[txid] = {"state": "READY" if vote == "YES" else "ABORTED", "op": op, "ts": time.time()}
+            wal_append(f"{txid} CAN_COMMIT {vote} {json.dumps(op)}")
+            self._send(200, {"ok": True, "vote": vote, "state": TX[txid]["state"]})
+            return
+
+        # ---------------------------
+        # 3PC /precommit
+        # ---------------------------
+        if self.path == "/precommit":
+            txid = str(body.get("txid", "")).strip()
+            if not txid:
+                self._send(400, {"ok": False, "error": "txid required"})
+                return
+            with lock:
+                rec = TX.get(txid)
+                if not rec or rec["state"] != "READY":
+                    self._send(409, {"ok": False, "error": "precommit requires READY state"})
+                    return
+                rec["state"] = "PRECOMMIT"
+            wal_append(f"{txid} PRECOMMIT")
+            self._send(200, {"ok": True, "txid": txid, "state": "PRECOMMIT"})
             return
 
         self._send(404, {"ok": False, "error": "not found"})
@@ -265,23 +232,23 @@ class Handler(BaseHTTPRequestHandler):
 # Main
 # ---------------------------
 def main():
-    global NODE_ID, PORT, PARTICIPANTS
+    global NODE_ID, PORT, WAL_PATH
     ap = argparse.ArgumentParser()
-    ap.add_argument("--id", default="COORD")
+    ap.add_argument("--id", required=True)
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--participants", required=True, help="Comma-separated participant base URLs (http://IP:PORT)")
+    ap.add_argument("--port", type=int, default=8001)
+    ap.add_argument("--wal", default="", help="Optional WAL path (/tmp/participant_B.wal)")
     args = ap.parse_args()
 
     NODE_ID = args.id
     PORT = args.port
-    PARTICIPANTS = [p.strip() for p in args.participants.split(",") if p.strip()]
+    WAL_PATH = args.wal.strip() or None
 
-    # Replay WAL to restore transactions after crash
+    # Replay WAL to recover TX state and KV store
     replay_wal()
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[{NODE_ID}] Coordinator listening on {args.host}:{args.port} participants={PARTICIPANTS}")
+    print(f"[{NODE_ID}] Participant listening on {args.host}:{args.port} wal={WAL_PATH}")
     server.serve_forever()
 
 if __name__ == "__main__":
